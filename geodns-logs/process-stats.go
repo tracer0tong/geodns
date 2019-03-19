@@ -4,15 +4,16 @@ import (
 	"bufio"
 	"encoding/json"
 	"flag"
-	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/hpcloud/tail"
 	"github.com/miekg/dns"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/abh/geodns/countries"
 	"github.com/abh/geodns/querylog"
@@ -22,21 +23,24 @@ import (
 // Add vendor yes/no
 // add server region tag (identifier)?
 
+const UserAgent = "geodns-logs/2.0"
+
 func main() {
 
-	tailFlag := flag.Bool("tail", false, "tail the log file instead of processing all arguments")
+	log.Printf("Starting %q", UserAgent)
+
 	identifierFlag := flag.String("identifier", "", "identifier (hostname, pop name or similar)")
-	verboseFlag := flag.Bool("verbose", false, "verbose output")
+	// verboseFlag := flag.Bool("verbose", false, "verbose output")
 	flag.Parse()
 
 	var serverID string
-	var serverGroups []string
+	// var serverGroups []string
 
 	if len(*identifierFlag) > 0 {
 		ids := strings.Split(*identifierFlag, ",")
 		serverID = ids[0]
 		if len(ids) > 1 {
-			serverGroups = ids[1:]
+			// serverGroups = ids[1:]
 		}
 	}
 
@@ -49,64 +53,61 @@ func main() {
 		}
 	}
 
-	influx := NewInfluxClient()
-	influx.URL = os.Getenv("INFLUXDB_URL")
-	influx.Username = os.Getenv("INFLUXDB_USERNAME")
-	influx.Password = os.Getenv("INFLUXDB_PASSWORD")
-	influx.Database = os.Getenv("INFLUXDB_DATABASE")
+	queries = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dns_logs_total",
+			Help: "Number of served queries",
+		},
+		[]string{"zone", "vendor", "usercc", "poolcc", "qtype"},
+	)
+	prometheus.MustRegister(queries)
 
-	influx.ServerID = serverID
-	influx.ServerGroups = serverGroups
-	influx.Verbose = *verboseFlag
+	buildInfo := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "geodns_logs_build_info",
+			Help: "GeoDNS logs build information (in labels)",
+		},
+		[]string{"Version"},
+	)
+	prometheus.MustRegister(buildInfo)
+	buildInfo.WithLabelValues(UserAgent).Set(1)
 
-	err := influx.Start()
-	if err != nil {
-		log.Printf("Could not start influxdb poster: %s", err)
-		os.Exit(2)
-	}
+	http.Handle("/metrics", promhttp.Handler())
+	go func() {
+		err := http.ListenAndServe(":8054", nil)
+		if err != nil {
+			log.Printf("could not start http server: %s", err)
+		}
+	}()
 
 	if len(flag.Args()) < 1 {
 		log.Printf("filename to process required")
 		os.Exit(2)
 	}
 
-	if *tailFlag {
+	filename := flag.Arg(0)
 
-		filename := flag.Arg(0)
-
-		logf, err := tail.TailFile(filename, tail.Config{
-			// Location:  &tail.SeekInfo{-1, 0},
-			Poll:      true, // inotify is flaky on EL6, so try this ...
-			ReOpen:    true,
-			MustExist: false,
-			Follow:    true,
-		})
-		if err != nil {
-			log.Printf("Could not tail '%s': %s", filename, err)
-		}
-
-		in := make(chan string)
-
-		go processChan(in, influx.Channel, nil)
-
-		for line := range logf.Lines {
-			if line.Err != nil {
-				log.Printf("Error tailing file: %s", line.Err)
-			}
-			in <- line.Text
-		}
-	} else {
-		for _, file := range flag.Args() {
-			log.Printf("Log: %s", file)
-			err := processFile(file, influx.Channel)
-			if err != nil {
-				log.Printf("Error processing '%s': %s", file, err)
-			}
-			log.Printf("Done with %s", file)
-		}
+	logf, err := tail.TailFile(filename, tail.Config{
+		// Location:  &tail.SeekInfo{-1, 0},
+		Poll:      true, // inotify is flaky on EL6, so try this ...
+		ReOpen:    true,
+		MustExist: false,
+		Follow:    true,
+	})
+	if err != nil {
+		log.Printf("Could not tail '%s': %s", filename, err)
 	}
 
-	influx.Close()
+	in := make(chan string)
+	go processChan(in, nil)
+
+	for line := range logf.Lines {
+		if line.Err != nil {
+			log.Printf("Error tailing file: %s", line.Err)
+		}
+		in <- line.Text
+	}
+
 }
 
 var extraValidLabels = map[string]struct{}{
@@ -159,56 +160,27 @@ func getPoolCC(label string) (string, bool) {
 	return "", false
 }
 
-func processChan(in chan string, out chan<- *Stats, wg *sync.WaitGroup) error {
+func processChan(in chan string, wg *sync.WaitGroup) error {
 	e := querylog.Entry{}
 
-	// the grafana queries depend on this being one minute
-	submitInterval := time.Minute * 1
-
 	stats := NewStats()
-	i := 0
-	lastMinute := int64(0)
+
 	for line := range in {
 		err := json.Unmarshal([]byte(line), &e)
 		if err != nil {
 			log.Printf("Can't unmarshal '%s': %s", line, err)
 			return err
 		}
-
-		eMinute := ((e.Time - e.Time%int64(submitInterval)) / int64(time.Second))
-		e.Time = eMinute
-
-		if len(stats.Map) == 0 {
-			lastMinute = eMinute
-			log.Printf("Last Minute: %d", lastMinute)
-		} else {
-			if eMinute > lastMinute {
-				fmt.Printf("eMinute %d\nlastMin %d - should summarize\n", eMinute, lastMinute)
-
-				stats.Summarize()
-				out <- stats
-				stats = NewStats()
-				lastMinute = eMinute
-			}
-		}
-
 		e.Name = strings.ToLower(e.Name)
+
 		// fmt.Printf("%s %s\n", e.Origin, e.Name)
 
 		err = stats.Add(&e)
 		if err != nil {
 			return err
 		}
-
-		if i%10000 == 0 {
-			// pretty.Println(stats)
-		}
-		// minute
 	}
 
-	if len(stats.Map) > 0 {
-		out <- stats
-	}
 	if wg != nil {
 		wg.Done()
 	}
@@ -225,7 +197,7 @@ func processFile(file string, out chan<- *Stats) error {
 
 	wg := sync.WaitGroup{}
 	wg.Add(1)
-	go processChan(in, out, &wg)
+	go processChan(in, &wg)
 
 	scanner := bufio.NewScanner(fh)
 
